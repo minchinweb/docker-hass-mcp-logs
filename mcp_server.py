@@ -2,6 +2,9 @@ import asyncio
 import hmac
 import json
 import os
+import re
+import threading
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
@@ -23,7 +26,7 @@ MCP_PUBLIC_URL = os.environ["MCP_PUBLIC_URL"].rstrip("/")
 
 # Bump on every change to the tool set. Build metadata comes from the image
 # (see Dockerfile) and falls back to "unknown" for non-Docker runs.
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 BUILD_COMMIT = os.environ.get("BUILD_COMMIT", "unknown")
 BUILD_DATE = os.environ.get("BUILD_DATE", "unknown")
 STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -101,6 +104,90 @@ async def ha_rest_get(path: str, params: dict | None = None, timeout: float = 30
         )
         r.raise_for_status()
         return r.json()
+
+
+# Live event buffer. HA only keeps past states in the recorder, so to see what
+# actually arrived at a given moment (e.g. an overnight alarm event) we keep a
+# rolling window of recent events from a background WebSocket subscription.
+# It runs in its own thread/loop so it starts with the process regardless of
+# MCP lifecycle hooks. Only state changes for entities matching
+# EVENT_BUFFER_ENTITIES (regex on entity_id) and automation_triggered events
+# are kept.
+EVENT_BUFFER_ENTITIES = re.compile(
+    os.environ.get(
+        "EVENT_BUFFER_ENTITIES",
+        r"sleep_as_android|nightlight|^person\.|^automation\.",
+    )
+)
+EVENT_BUFFER_SIZE = int(os.environ.get("EVENT_BUFFER_SIZE", "2000"))
+_events: deque = deque(maxlen=EVENT_BUFFER_SIZE)
+_listener_status = {"connected": False, "since": None, "last_error": None}
+
+
+def _compact_event(ev: dict) -> dict | None:
+    etype = ev.get("event_type")
+    data = ev.get("data", {})
+    base = {"time_fired": ev.get("time_fired"), "event_type": etype}
+    if etype == "state_changed":
+        eid = data.get("entity_id", "")
+        if not EVENT_BUFFER_ENTITIES.search(eid):
+            return None
+        old, new = data.get("old_state") or {}, data.get("new_state") or {}
+        return {
+            **base,
+            "entity_id": eid,
+            "old_state": old.get("state"),
+            "new_state": new.get("state"),
+            "new_event_type": (new.get("attributes") or {}).get("event_type"),
+        }
+    if etype == "automation_triggered":
+        return {
+            **base,
+            "entity_id": data.get("entity_id"),
+            "name": data.get("name"),
+            "source": data.get("source"),
+        }
+    return None
+
+
+async def _listen_events() -> None:
+    backoff = 5
+    while True:
+        try:
+            async with websockets.connect(HA_WS, max_size=16 * 1024 * 1024) as ws:
+                await ws.recv()  # auth_required
+                await ws.send(json.dumps({"type": "auth", "access_token": TOKEN}))
+                if json.loads(await ws.recv()).get("type") != "auth_ok":
+                    raise RuntimeError("HA auth failed")
+                for i, etype in enumerate(("state_changed", "automation_triggered"), 1):
+                    await ws.send(
+                        json.dumps(
+                            {"id": i, "type": "subscribe_events", "event_type": etype}
+                        )
+                    )
+                _listener_status.update(
+                    connected=True,
+                    since=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                )
+                backoff = 5
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    if msg.get("type") == "event":
+                        rec = _compact_event(msg["event"])
+                        if rec:
+                            _events.append(rec)
+        except Exception as e:  # reconnect on any failure
+            _listener_status.update(connected=False, last_error=repr(e))
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 60)
+
+
+def _start_event_listener() -> None:
+    threading.Thread(
+        target=lambda: asyncio.run(_listen_events()),
+        name="ha-event-listener",
+        daemon=True,
+    ).start()
 
 
 def _since(hours: float) -> str:
@@ -286,7 +373,31 @@ async def get_state(entity_id: str = "", contains: str = "") -> str:
     return _dump(out)
 
 
+@mcp.tool()
+async def get_recent_events(
+    contains: str = "", event_type: str = "", minutes: float = 720
+) -> str:
+    """Events this server has seen live from HA's event bus since it started,
+    independent of the recorder. Covers state changes of Sleep as Android,
+    nightlight, person and automation entities, plus automation_triggered.
+    Event entities show `new_event_type` (e.g. alert_start). Filter with
+    `contains` (substring of entity_id/name), `event_type` (state_changed or
+    automation_triggered) and `minutes` of lookback. The buffer is in memory,
+    so it is empty after a server restart; `listener` shows its health."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+    needle = contains.lower()
+    out = [
+        e
+        for e in list(_events)
+        if (e["time_fired"] or "") >= cutoff
+        and (not event_type or e["event_type"] == event_type)
+        and (not needle or needle in json.dumps(e).lower())
+    ]
+    return _dump({"listener": _listener_status, "count": len(out), "events": out})
+
+
 if __name__ == "__main__":
+    _start_event_listener()
     mcp.run(
         transport="streamable-http",
         host="0.0.0.0",
