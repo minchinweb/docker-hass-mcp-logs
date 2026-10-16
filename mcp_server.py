@@ -2,6 +2,8 @@ import asyncio
 import hmac
 import json
 import os
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import httpx
 from mcp.server.auth.provider import AccessToken, TokenVerifier
@@ -27,7 +29,7 @@ class StaticTokenVerifier(TokenVerifier):
 
 mcp = MCPServer(
     "homeassistant-support",
-    version="1.1.1",
+    version="1.2.0",
     token_verifier=StaticTokenVerifier(),
     auth=AuthSettings(
         # issuer_url=AnyHttpUrl("http://127.0.0.1:8000"),
@@ -58,6 +60,32 @@ async def ha_ws_call(payload: dict, timeout: float = 20) -> dict | list:
             if not resp.get("success"):
                 raise RuntimeError(f"HA error: {resp.get('error')}")
             return resp["result"]
+
+
+async def ha_rest_get(path: str, params: dict | None = None, timeout: float = 30):
+    """GET a Home Assistant REST endpoint and return the decoded JSON."""
+    async with httpx.AsyncClient(timeout=timeout) as c:
+        r = await c.get(
+            f"{HA}{path}",
+            params=params,
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+def _since(hours: float) -> str:
+    """ISO timestamp `hours` ago (UTC), URL-safe for use in a path."""
+    ts = datetime.now(timezone.utc) - timedelta(hours=hours)
+    return quote(ts.isoformat(timespec="seconds"), safe="")
+
+
+def _dump(obj, limit: int = 60000) -> str:
+    """JSON-encode, truncating very large results so they stay readable."""
+    text = json.dumps(obj, indent=2, default=str)
+    if len(text) > limit:
+        text = text[:limit] + f"\n... truncated ({len(text) - limit} more characters)"
+    return text
 
 
 @mcp.tool()
@@ -104,6 +132,91 @@ async def get_dashboard_config(url_path: str | None = None) -> str:
 async def list_lovelace_resources() -> str:
     """Custom card/module resources (e.g. HACS cards) registered with Lovelace."""
     return json.dumps(await ha_ws_call({"type": "lovelace/resources"}), indent=2)
+
+
+@mcp.tool()
+async def list_automations(contains: str = "") -> str:
+    """Automations with state (on/off), last_triggered and the config `id`
+    needed by get_automation_config / list_traces / get_trace. `contains`
+    filters on entity_id or friendly name (case-insensitive)."""
+    needle = contains.lower()
+    out = []
+    for st in await ha_rest_get("/api/states"):
+        eid = st["entity_id"]
+        if not eid.startswith("automation."):
+            continue
+        attrs = st["attributes"]
+        name = attrs.get("friendly_name") or ""
+        if needle and needle not in f"{eid} {name}".lower():
+            continue
+        out.append(
+            {
+                "entity_id": eid,
+                "name": name,
+                "id": attrs.get("id"),
+                "state": st["state"],
+                "last_triggered": attrs.get("last_triggered"),
+                "mode": attrs.get("mode"),
+                "current": attrs.get("current"),
+            }
+        )
+    return _dump(out)
+
+
+@mcp.tool()
+async def get_automation_config(automation_id: str) -> str:
+    """Full config (triggers, conditions, actions) of a UI-defined automation.
+    `automation_id` is the `id` from list_automations. YAML-defined
+    automations without an id are not available here."""
+    return _dump(await ha_rest_get(f"/api/config/automation/config/{automation_id}"))
+
+
+@mcp.tool()
+async def list_traces(automation_id: str) -> str:
+    """Recent runs of an automation (HA keeps ~5 by default): run_id,
+    timestamps, trigger, state and any error. `automation_id` is the `id`
+    from list_automations. An empty list means it has not run recently."""
+    return _dump(
+        await ha_ws_call(
+            {"type": "trace/list", "domain": "automation", "item_id": automation_id}
+        )
+    )
+
+
+@mcp.tool()
+async def get_trace(automation_id: str, run_id: str) -> str:
+    """Step-by-step trace for one automation run (run_id from list_traces):
+    which trigger fired, which conditions passed or failed, and each action's
+    result or error."""
+    return _dump(
+        await ha_ws_call(
+            {
+                "type": "trace/get",
+                "domain": "automation",
+                "item_id": automation_id,
+                "run_id": run_id,
+            }
+        )
+    )
+
+
+@mcp.tool()
+async def get_logbook(entity_id: str = "", hours: float = 48) -> str:
+    """Logbook entries for the last N hours, optionally for one entity. Shows
+    automation triggers and state changes, so it can tell 'never triggered'
+    from 'triggered but failed'."""
+    params = {"entity": entity_id} if entity_id else None
+    return _dump(await ha_rest_get(f"/api/logbook/{_since(hours)}", params))
+
+
+@mcp.tool()
+async def get_history(entity_id: str, hours: float = 24) -> str:
+    """State history of one entity for the last N hours (state + timestamps)."""
+    data = await ha_rest_get(
+        f"/api/history/period/{_since(hours)}",
+        {"filter_entity_id": entity_id, "minimal_response": "1", "no_attributes": "1"},
+    )
+    return _dump(data)
 
 
 if __name__ == "__main__":
