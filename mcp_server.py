@@ -10,6 +10,8 @@ from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
 from pydantic import AnyHttpUrl
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 import websockets
 
 HA = os.environ["HA_URL"].rstrip("/")
@@ -18,6 +20,13 @@ TOKEN = os.environ["HA_TOKEN"]
 MCP_PATH = "/" + os.environ["MCP_PATH"].lstrip("/")
 API_KEY = os.environ["MCP_AUTH_TOKEN"]
 MCP_PUBLIC_URL = os.environ["MCP_PUBLIC_URL"].rstrip("/")
+
+# Bump on every change to the tool set. Build metadata comes from the image
+# (see Dockerfile) and falls back to "unknown" for non-Docker runs.
+VERSION = "1.3.1"
+BUILD_COMMIT = os.environ.get("BUILD_COMMIT", "unknown")
+BUILD_DATE = os.environ.get("BUILD_DATE", "unknown")
+STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class StaticTokenVerifier(TokenVerifier):
@@ -29,7 +38,7 @@ class StaticTokenVerifier(TokenVerifier):
 
 mcp = MCPServer(
     "homeassistant-support",
-    version="1.2.0",
+    version=VERSION,
     token_verifier=StaticTokenVerifier(),
     auth=AuthSettings(
         # issuer_url=AnyHttpUrl("http://127.0.0.1:8000"),
@@ -39,6 +48,26 @@ mcp = MCPServer(
         required_scopes=["user"],
     ),
 )
+
+
+# Plain HTTP endpoint for quick checks (curl http://host:8000/version). It sits
+# outside the MCP auth, so it only reveals version and build info, never the
+# tool list (use get_server_info for that).
+if hasattr(mcp, "custom_route"):
+
+    @mcp.custom_route("/version", methods=["GET"])
+    async def version_endpoint(request: Request) -> JSONResponse:
+        return JSONResponse(
+            {
+                "name": "homeassistant-support",
+                "version": VERSION,
+                "build_commit": BUILD_COMMIT,
+                "build_date": BUILD_DATE,
+            }
+        )
+
+else:
+    print("WARNING: MCPServer has no custom_route; /version endpoint disabled")
 
 
 async def ha_ws_call(payload: dict, timeout: float = 20) -> dict | list:
@@ -86,6 +115,24 @@ def _dump(obj, limit: int = 60000) -> str:
     if len(text) > limit:
         text = text[:limit] + f"\n... truncated ({len(text) - limit} more characters)"
     return text
+
+
+@mcp.tool()
+async def get_server_info() -> str:
+    """Version and build info for this MCP server (version, build commit and
+    date, start time) plus the names of every registered tool. Use it to check
+    that a redeploy took effect and which tools this instance is serving."""
+    tools = sorted(t.name for t in await mcp.list_tools())
+    return _dump(
+        {
+            "name": "homeassistant-support",
+            "version": VERSION,
+            "build_commit": BUILD_COMMIT,
+            "build_date": BUILD_DATE,
+            "started_at": STARTED_AT,
+            "tools": tools,
+        }
+    )
 
 
 @mcp.tool()

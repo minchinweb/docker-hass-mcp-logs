@@ -15,6 +15,10 @@ ARG COMMIT="local-build"
 ARG URL="https://github.com/MinchinWeb/docker-hass-mcp-logs"
 ARG BRANCH="none"
 
+# expose build info to the running server (see get_server_info)
+ENV BUILD_COMMIT=${COMMIT} \
+    BUILD_DATE=${BUILD_DATE}
+
 LABEL maintainer="MinchinWeb" \
       org.label-schema.description="MCP server tp expose Home Assistant logs" \
       org.label-schema.build-date=${BUILD_DATE} \

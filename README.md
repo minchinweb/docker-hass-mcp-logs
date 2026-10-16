@@ -9,7 +9,16 @@ configs, traces and history. It is served over streamable HTTP and packaged as a
 The MCP endpoint is `MCP_PUBLIC_URL` + `/` + `MCP_PATH` (default
 `http://localhost:8000/mcp`). Clients must send `Authorization: Bearer <MCP_AUTH_TOKEN>`.
 
+`GET /version` (no auth) returns `{"name", "version", "build_commit", "build_date"}` as
+JSON, e.g. `curl http://localhost:8000/version`.
+
 ## Tools
+
+### Server info
+
+| Tool | Arguments | Description |
+| --- | --- | --- |
+| `get_server_info` | none | Server version, build commit and date, start time, and the list of registered tools. Use it to confirm a redeploy took effect. |
 
 ### Logs
 
@@ -61,7 +70,8 @@ Copy `.env.example` to `.env` and fill it in.
 ## Running
 
 ```sh
-docker build -t docker-hass-mcp-logs .
+docker build --build-arg COMMIT=$(git rev-parse --short HEAD) \
+  --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) -t docker-hass-mcp-logs .
 docker run --env-file .env -p 8000:8000 docker-hass-mcp-logs
 ```
 
