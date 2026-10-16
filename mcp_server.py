@@ -27,7 +27,7 @@ class StaticTokenVerifier(TokenVerifier):
 
 mcp = MCPServer(
     "homeassistant-support",
-    version="1.1.0",
+    version="1.1.1",
     token_verifier=StaticTokenVerifier(),
     auth=AuthSettings(
         # issuer_url=AnyHttpUrl("http://127.0.0.1:8000"),
