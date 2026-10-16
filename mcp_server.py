@@ -23,7 +23,7 @@ MCP_PUBLIC_URL = os.environ["MCP_PUBLIC_URL"].rstrip("/")
 
 # Bump on every change to the tool set. Build metadata comes from the image
 # (see Dockerfile) and falls back to "unknown" for non-Docker runs.
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 BUILD_COMMIT = os.environ.get("BUILD_COMMIT", "unknown")
 BUILD_DATE = os.environ.get("BUILD_DATE", "unknown")
 STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -257,13 +257,33 @@ async def get_logbook(entity_id: str = "", hours: float = 48) -> str:
 
 
 @mcp.tool()
-async def get_history(entity_id: str, hours: float = 24) -> str:
-    """State history of one entity for the last N hours (state + timestamps)."""
-    data = await ha_rest_get(
-        f"/api/history/period/{_since(hours)}",
-        {"filter_entity_id": entity_id, "minimal_response": "1", "no_attributes": "1"},
-    )
-    return _dump(data)
+async def get_history(
+    entity_id: str, hours: float = 24, include_attributes: bool = False
+) -> str:
+    """State history of one entity for the last N hours (state + timestamps).
+    Set include_attributes=True for full states with attributes, e.g. the
+    `event_type` of an event entity."""
+    params = {"filter_entity_id": entity_id}
+    if not include_attributes:
+        params.update({"minimal_response": "1", "no_attributes": "1"})
+    return _dump(await ha_rest_get(f"/api/history/period/{_since(hours)}", params))
+
+
+@mcp.tool()
+async def get_state(entity_id: str = "", contains: str = "") -> str:
+    """Current state and attributes. Pass entity_id for one entity, or
+    `contains` to list every entity whose id or friendly name matches
+    (case-insensitive), e.g. to find all the Sleep as Android entities."""
+    if entity_id:
+        return _dump(await ha_rest_get(f"/api/states/{entity_id}"))
+    needle = contains.lower()
+    out = [
+        st
+        for st in await ha_rest_get("/api/states")
+        if needle
+        in f"{st['entity_id']} {st['attributes'].get('friendly_name') or ''}".lower()
+    ]
+    return _dump(out)
 
 
 if __name__ == "__main__":
