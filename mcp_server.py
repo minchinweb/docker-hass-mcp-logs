@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import hmac
 import json
 import os
@@ -26,7 +27,7 @@ MCP_PUBLIC_URL = os.environ["MCP_PUBLIC_URL"].rstrip("/")
 
 # Bump on every change to the tool set. Build metadata comes from the image
 # (see Dockerfile) and falls back to "unknown" for non-Docker runs.
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 BUILD_COMMIT = os.environ.get("BUILD_COMMIT", "unknown")
 BUILD_DATE = os.environ.get("BUILD_DATE", "unknown")
 STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -204,7 +205,35 @@ def _dump(obj, limit: int = 60000) -> str:
     return text
 
 
-@mcp.tool()
+def _friendly_errors(fn):
+    """Return HA failures as readable text instead of raising.
+
+    The MCP SDK reduces a raised exception to a bare 'Error executing tool X',
+    which hides e.g. a 404 for an entity that no longer exists."""
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            hint = " (not found: the entity or item may not exist)" if status == 404 else ""
+            body = e.response.text.strip()[:300]
+            return f"Error: Home Assistant returned HTTP {status}{hint} for {e.request.url.path}. {body}"
+        except httpx.HTTPError as e:
+            return f"Error: could not reach Home Assistant: {type(e).__name__}: {e}"
+        except RuntimeError as e:
+            return f"Error: {e}"
+
+    return wrapper
+
+
+def tool(fn):
+    """Register fn as an MCP tool with friendly error reporting."""
+    return mcp.tool()(_friendly_errors(fn))
+
+
+@tool
 async def get_server_info() -> str:
     """Version and build info for this MCP server (version, build commit and
     date, start time) plus the names of every registered tool. Use it to check
@@ -222,7 +251,7 @@ async def get_server_info() -> str:
     )
 
 
-@mcp.tool()
+@tool
 async def get_error_log(
     min_level: str = "WARNING",
     tail_lines: int = 500,
@@ -246,14 +275,14 @@ async def get_error_log(
     return "\n".join(lines[-tail_lines:])
 
 
-@mcp.tool()
+@tool
 async def list_dashboards() -> str:
     """List Lovelace dashboards (url_path, title, mode). The default dashboard
     is not included; use url_path=None with get_dashboard_config for it."""
     return json.dumps(await ha_ws_call({"type": "lovelace/dashboards/list"}), indent=2)
 
 
-@mcp.tool()
+@tool
 async def get_dashboard_config(url_path: str | None = None) -> str:
     """Full Lovelace config for a dashboard. Omit url_path for the default one."""
     return json.dumps(
@@ -262,13 +291,13 @@ async def get_dashboard_config(url_path: str | None = None) -> str:
     )
 
 
-@mcp.tool()
+@tool
 async def list_lovelace_resources() -> str:
     """Custom card/module resources (e.g. HACS cards) registered with Lovelace."""
     return json.dumps(await ha_ws_call({"type": "lovelace/resources"}), indent=2)
 
 
-@mcp.tool()
+@tool
 async def list_automations(contains: str = "") -> str:
     """Automations with state (on/off), last_triggered and the config `id`
     needed by get_automation_config / list_traces / get_trace. `contains`
@@ -297,7 +326,7 @@ async def list_automations(contains: str = "") -> str:
     return _dump(out)
 
 
-@mcp.tool()
+@tool
 async def get_automation_config(automation_id: str) -> str:
     """Full config (triggers, conditions, actions) of a UI-defined automation.
     `automation_id` is the `id` from list_automations. YAML-defined
@@ -305,7 +334,7 @@ async def get_automation_config(automation_id: str) -> str:
     return _dump(await ha_rest_get(f"/api/config/automation/config/{automation_id}"))
 
 
-@mcp.tool()
+@tool
 async def list_traces(automation_id: str) -> str:
     """Recent runs of an automation (HA keeps ~5 by default): run_id,
     timestamps, trigger, state and any error. `automation_id` is the `id`
@@ -317,7 +346,7 @@ async def list_traces(automation_id: str) -> str:
     )
 
 
-@mcp.tool()
+@tool
 async def get_trace(automation_id: str, run_id: str) -> str:
     """Step-by-step trace for one automation run (run_id from list_traces):
     which trigger fired, which conditions passed or failed, and each action's
@@ -334,7 +363,7 @@ async def get_trace(automation_id: str, run_id: str) -> str:
     )
 
 
-@mcp.tool()
+@tool
 async def get_logbook(entity_id: str = "", hours: float = 48) -> str:
     """Logbook entries for the last N hours, optionally for one entity. Shows
     automation triggers and state changes, so it can tell 'never triggered'
@@ -343,7 +372,7 @@ async def get_logbook(entity_id: str = "", hours: float = 48) -> str:
     return _dump(await ha_rest_get(f"/api/logbook/{_since(hours)}", params))
 
 
-@mcp.tool()
+@tool
 async def get_history(
     entity_id: str, hours: float = 24, include_attributes: bool = False
 ) -> str:
@@ -356,7 +385,7 @@ async def get_history(
     return _dump(await ha_rest_get(f"/api/history/period/{_since(hours)}", params))
 
 
-@mcp.tool()
+@tool
 async def get_state(entity_id: str = "", contains: str = "") -> str:
     """Current state and attributes. Pass entity_id for one entity, or
     `contains` to list every entity whose id or friendly name matches
@@ -373,7 +402,7 @@ async def get_state(entity_id: str = "", contains: str = "") -> str:
     return _dump(out)
 
 
-@mcp.tool()
+@tool
 async def get_recent_events(
     contains: str = "", event_type: str = "", minutes: float = 720
 ) -> str:
