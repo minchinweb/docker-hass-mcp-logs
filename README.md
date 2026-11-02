@@ -24,7 +24,8 @@ JSON, e.g. `curl http://localhost:8000/version`.
 
 | Tool | Arguments | Description |
 | --- | --- | --- |
-| `get_error_log` | `min_level="WARNING"`, `tail_lines=500`, `contains=""` | Home Assistant log, filtered by level and substring, last N lines. |
+| `get_error_log` | `min_level="WARNING"`, `tail_lines=500`, `contains=""` | Home Assistant log, one line per entry, filtered by level and substring (`contains` also searches tracebacks), last N entries. Entries with a traceback or continuation lines are marked `[+N lines]`; read them with `get_log_entry`. |
+| `get_log_entry` | `at`, `contains=""`, `max_lines=200` | Full text of log entries including traceback lines. `at` is the start of the timestamp shown by `get_error_log` (e.g. `2026-11-01 17:30:36.961`, or just to the second). |
 
 ### Dashboards
 

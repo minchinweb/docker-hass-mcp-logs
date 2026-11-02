@@ -27,7 +27,7 @@ MCP_PUBLIC_URL = os.environ["MCP_PUBLIC_URL"].rstrip("/")
 
 # Bump on every change to the tool set. Build metadata comes from the image
 # (see Dockerfile) and falls back to "unknown" for non-Docker runs.
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 BUILD_COMMIT = os.environ.get("BUILD_COMMIT", "unknown")
 BUILD_DATE = os.environ.get("BUILD_DATE", "unknown")
 STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -251,28 +251,70 @@ async def get_server_info() -> str:
     )
 
 
+_LOG_HEADER = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+
+
+async def _fetch_log_records() -> list[list[str]]:
+    """The HA log as records: a timestamped line plus any continuation lines
+    (traceback frames, wrapped messages) that follow it."""
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(
+            f"{HA}/api/error_log", headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+        r.raise_for_status()
+    records: list[list[str]] = []
+    for line in r.text.splitlines():
+        if _LOG_HEADER.match(line):
+            records.append([line])
+        elif records:
+            records[-1].append(line)
+    return records
+
+
 @tool
 async def get_error_log(
     min_level: str = "WARNING",
     tail_lines: int = 500,
     contains: str = "",
 ) -> str:
-    """Home Assistant log, filtered by level, substring, last N lines."""
-
-    async with httpx.AsyncClient(timeout=20) as c:
-        r = await c.get(
-            f"{HA}/api/error_log", headers={"Authorization": f"Bearer {TOKEN}"}
-        )
-        r.raise_for_status()
-
+    """Home Assistant log: one line per entry, filtered by level and substring
+    (`contains` also searches tracebacks), last `tail_lines` entries. An entry
+    with a traceback or continuation lines is marked `[+N lines]`; pass its
+    timestamp to get_log_entry to read the rest."""
     levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
     ok = levels[levels.index(min_level.upper()) :]
-    lines = [
-        l
-        for l in r.text.splitlines()
-        if any(f" {x} " in l for x in ok) and contains.lower() in l.lower()
+    needle = contains.lower()
+    out = []
+    for rec in await _fetch_log_records():
+        if not any(f" {x} " in rec[0] for x in ok):
+            continue
+        if needle and needle not in "\n".join(rec).lower():
+            continue
+        extra = len(rec) - 1
+        out.append(rec[0] + (f"  [+{extra} lines]" if extra else ""))
+    return "\n".join(out[-tail_lines:])
+
+
+@tool
+async def get_log_entry(at: str, contains: str = "", max_lines: int = 200) -> str:
+    """Full text of log entries, including traceback and continuation lines.
+    `at` is the start of the entry's timestamp as shown by get_error_log, e.g.
+    '2026-11-01 17:30:36.961' (or just '2026-11-01 17:30:36' for every entry in
+    that second). `contains` narrows further; output is capped at `max_lines`."""
+    at = at.strip()
+    needle = contains.lower()
+    found = [
+        rec
+        for rec in await _fetch_log_records()
+        if rec[0].startswith(at) and needle in "\n".join(rec).lower()
     ]
-    return "\n".join(lines[-tail_lines:])
+    if not found:
+        return f"No log entry found starting with {at!r}."
+    lines = "\n\n".join("\n".join(rec) for rec in found).splitlines()
+    text = "\n".join(lines[:max_lines])
+    if len(lines) > max_lines:
+        text += f"\n... truncated ({len(lines) - max_lines} more lines)"
+    return text
 
 
 @tool
