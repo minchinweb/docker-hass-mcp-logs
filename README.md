@@ -52,7 +52,17 @@ without an `id` can't be read by `get_automation_config`, `list_traces` or `get_
 | Tool | Arguments | Description |
 | --- | --- | --- |
 | `get_logbook` | `entity_id=""`, `hours=48` | Logbook entries (automation triggers, state changes), optionally for one entity. Shows whether an automation triggered at all. |
-| `get_history` | `entity_id`, `hours=24` | State history of one entity: states and timestamps. |
+| `get_history` | `entity_id`, `hours=24`, `include_attributes=False` | State history of one entity: states and timestamps, with attributes if asked. |
+
+### States, areas and integrations
+
+| Tool | Arguments | Description |
+| --- | --- | --- |
+| `get_state` | `entity_id=""`, `contains=""` | Current state and attributes of one entity, or of every entity whose ID or name contains the text. |
+| `list_areas` | none | Floors (with level) and areas (ID, name, floor, aliases). |
+| `list_integration_entities` | `domain`, `include_attributes=True` | Every entity an integration provides (e.g. `house_structure`), with its device, area, floor, state and attributes. Finds renamed entities too. |
+| `get_config_entries` | `domain` | An integration's config entries and their subentries (ID, type, title). Home Assistant's API doesn't give the saved settings, so they come from the integration's diagnostics where it has them. |
+| `get_recent_events` | `contains=""`, `event_type=""`, `minutes=720` | Events seen live since the server started: state changes of the entities matching `EVENT_BUFFER_ENTITIES`, and `automation_triggered`. |
 
 Large results are truncated at about 60,000 characters.
 

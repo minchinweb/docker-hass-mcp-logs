@@ -27,7 +27,7 @@ MCP_PUBLIC_URL = os.environ["MCP_PUBLIC_URL"].rstrip("/")
 
 # Bump on every change to the tool set. Build metadata comes from the image
 # (see Dockerfile) and falls back to "unknown" for non-Docker runs.
-VERSION = "1.5.2"
+VERSION = "1.6.0"
 BUILD_COMMIT = os.environ.get("BUILD_COMMIT", "unknown")
 BUILD_DATE = os.environ.get("BUILD_DATE", "unknown")
 STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -441,6 +441,117 @@ async def get_state(entity_id: str = "", contains: str = "") -> str:
         if needle
         in f"{st['entity_id']} {st['attributes'].get('friendly_name') or ''}".lower()
     ]
+    return _dump(out)
+
+
+async def _areas() -> dict[str, dict]:
+    """Areas by id, each with its floor's name added as `floor`."""
+    areas, floors = await asyncio.gather(
+        ha_ws_call({"type": "config/area_registry/list"}),
+        ha_ws_call({"type": "config/floor_registry/list"}),
+    )
+    floor_names = {f["floor_id"]: f["name"] for f in floors}
+    return {
+        a["area_id"]: {**a, "floor": floor_names.get(a.get("floor_id"))} for a in areas
+    }
+
+
+@tool
+async def list_areas() -> str:
+    """Floors (with their level) and areas (id, name, floor, aliases). Use it to
+    see which rooms exist and on which floor."""
+    areas, floors = await asyncio.gather(
+        _areas(), ha_ws_call({"type": "config/floor_registry/list"})
+    )
+    return _dump(
+        {
+            "floors": [
+                {"floor_id": f["floor_id"], "name": f["name"], "level": f.get("level")}
+                for f in floors
+            ],
+            "areas": [
+                {
+                    "area_id": a["area_id"],
+                    "name": a["name"],
+                    "floor_id": a.get("floor_id"),
+                    "floor": a["floor"],
+                    "aliases": a.get("aliases") or [],
+                }
+                for a in areas.values()
+            ],
+        }
+    )
+
+
+@tool
+async def list_integration_entities(
+    domain: str, include_attributes: bool = True
+) -> str:
+    """Every entity an integration provides (its entity registry `platform`,
+    e.g. `house_structure`), with its device, area (the entity's own, else its
+    device's), floor, current state and, by default, attributes. Finds them
+    even when renamed, unlike get_state's name search."""
+    entities, devices, areas, states = await asyncio.gather(
+        ha_ws_call({"type": "config/entity_registry/list"}),
+        ha_ws_call({"type": "config/device_registry/list"}),
+        _areas(),
+        ha_rest_get("/api/states"),
+    )
+    devices = {d["id"]: d for d in devices}
+    states = {s["entity_id"]: s for s in states}
+    out = []
+    for e in entities:
+        if e.get("platform") != domain:
+            continue
+        device = devices.get(e.get("device_id")) or {}
+        area = areas.get(e.get("area_id") or device.get("area_id")) or {}
+        state = states.get(e["entity_id"]) or {}
+        item = {
+            "entity_id": e["entity_id"],
+            "unique_id": e.get("unique_id"),
+            "disabled_by": e.get("disabled_by"),
+            "device": device.get("name_by_user") or device.get("name"),
+            "device_model": device.get("model"),
+            "area_id": area.get("area_id"),
+            "area": area.get("name"),
+            "floor": area.get("floor"),
+            "state": state.get("state"),
+        }
+        if include_attributes:
+            item["attributes"] = state.get("attributes")
+        out.append(item)
+    return _dump(sorted(out, key=lambda x: x["entity_id"]))
+
+
+@tool
+async def get_config_entries(domain: str) -> str:
+    """An integration's config entries (title, state, any setup error) and
+    their subentries (id, type, title). HA's API doesn't expose the saved
+    settings; when the integration supports diagnostics they are under
+    `diagnostics` (HA redacts what the integration marks secret), otherwise
+    `diagnostics` says it isn't available."""
+    entries = await ha_ws_call({"type": "config_entries/get", "domain": domain})
+    out = []
+    for entry in entries:
+        entry_id = entry["entry_id"]
+        item = {
+            k: entry.get(k)
+            for k in ("entry_id", "title", "state", "disabled_by", "reason")
+        }
+        item["subentries"] = await ha_ws_call(
+            {"type": "config_entries/subentries/list", "entry_id": entry_id}
+        )
+        try:
+            diagnostics = await ha_rest_get(
+                f"/api/diagnostics/config_entry/{quote(entry_id)}"
+            )
+            item["diagnostics"] = diagnostics.get("data", diagnostics)
+        except httpx.HTTPStatusError as e:
+            item["diagnostics"] = (
+                f"not available (HTTP {e.response.status_code}); "
+                "the integration may not support diagnostics"
+            )
+        out.append(item)
     return _dump(out)
 
 
