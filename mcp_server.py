@@ -27,7 +27,7 @@ MCP_PUBLIC_URL = os.environ["MCP_PUBLIC_URL"].rstrip("/")
 
 # Bump on every change to the tool set. Build metadata comes from the image
 # (see Dockerfile) and falls back to "unknown" for non-Docker runs.
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 BUILD_COMMIT = os.environ.get("BUILD_COMMIT", "unknown")
 BUILD_DATE = os.environ.get("BUILD_DATE", "unknown")
 STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -553,6 +553,98 @@ async def get_config_entries(domain: str) -> str:
             )
         out.append(item)
     return _dump(out)
+
+
+async def _manifests() -> tuple[list[dict], str | None]:
+    """Manifests of the integrations HA has loaded, or an error message if HA
+    refuses the request (so the rest of the integration info still comes back)."""
+    try:
+        return await ha_ws_call({"type": "manifest/list"}), None
+    except Exception as e:  # keep the other data even if this call fails
+        return [], f"{type(e).__name__}: {e}"
+
+
+@tool
+async def list_integrations(contains: str = "", custom_only: bool = False) -> str:
+    """Integrations installed in Home Assistant, each with whether it is
+    activated and its version. `activated` is true when the integration is
+    loaded (a loaded config entry, or loaded from YAML). `entries` gives the
+    state of each config entry (loaded, setup_error, not_loaded, ...) and
+    `disabled_by` when it has been disabled. `version` is the integration's own
+    version for custom integrations (e.g. HACS); core integrations have no
+    version of their own, so they report the Home Assistant core version.
+    `contains` filters on domain or name; `custom_only` keeps only custom
+    integrations."""
+    config, entries, (manifests, manifest_error) = await asyncio.gather(
+        ha_rest_get("/api/config"),
+        ha_ws_call({"type": "config_entries/get"}),
+        _manifests(),
+    )
+    loaded = {c.split(".", 1)[0] for c in config.get("components", [])}
+    core_version = config.get("version")
+
+    by_domain: dict[str, list[dict]] = {}
+    for e in entries:
+        by_domain.setdefault(e["domain"], []).append(
+            {
+                "title": e.get("title"),
+                "state": e.get("state"),
+                "disabled_by": e.get("disabled_by"),
+            }
+        )
+    info = {m["domain"]: m for m in manifests if m.get("domain")}
+
+    # manifest/list only covers loaded integrations. Entries of unloaded ones
+    # (disabled, failed setup) need manifest/get, or a custom one would look core.
+    missing = sorted(set(by_domain) - set(info))
+    if missing:
+        fetched = await asyncio.gather(
+            *(
+                ha_ws_call({"type": "manifest/get", "integration": d})
+                for d in missing
+            ),
+            return_exceptions=True,
+        )
+        for d, res in zip(missing, fetched):
+            if isinstance(res, dict):
+                info[d] = res
+
+    needle = contains.lower()
+    out = []
+    for domain in sorted(set(info) | set(by_domain) | loaded):
+        m = info.get(domain)
+        name = (m or {}).get("name") or domain
+        if needle and needle not in f"{domain} {name}".lower():
+            continue
+        # Every manifest carries is_built_in; custom ones also declare a version.
+        custom = m is not None and not m.get("is_built_in", True)
+        if custom_only and not custom:
+            continue
+        domain_entries = by_domain.get(domain, [])
+        # HA keeps a domain in `components` even when its setup failed, so with
+        # entries, only a loaded entry counts; YAML-only ones use `components`.
+        if domain_entries:
+            activated = any(x["state"] == "loaded" for x in domain_entries)
+        else:
+            activated = domain in loaded
+        out.append(
+            {
+                "domain": domain,
+                "name": name,
+                "custom": custom,
+                "version": (m or {}).get("version") if custom else core_version,
+                "activated": activated,
+                "entries": domain_entries,
+            }
+        )
+    return _dump(
+        {
+            "ha_version": core_version,
+            "manifest_error": manifest_error,
+            "count": len(out),
+            "integrations": out,
+        }
+    )
 
 
 @tool
