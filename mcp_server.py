@@ -27,7 +27,7 @@ MCP_PUBLIC_URL = os.environ["MCP_PUBLIC_URL"].rstrip("/")
 
 # Bump on every change to the tool set. Build metadata comes from the image
 # (see Dockerfile) and falls back to "unknown" for non-Docker runs.
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 BUILD_COMMIT = os.environ.get("BUILD_COMMIT", "unknown")
 BUILD_DATE = os.environ.get("BUILD_DATE", "unknown")
 STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -643,6 +643,253 @@ async def list_integrations(contains: str = "", custom_only: bool = False) -> st
             "manifest_error": manifest_error,
             "count": len(out),
             "integrations": out,
+        }
+    )
+
+
+async def _repairs() -> list[dict]:
+    """Home Assistant's repairs (Settings > Repairs), compacted."""
+    result = await ha_ws_call({"type": "repairs/list_issues"})
+    keys = (
+        "domain",
+        "issue_id",
+        "severity",
+        "translation_key",
+        "translation_placeholders",
+        "is_fixable",
+        "ignored",
+        "created",
+        "breaks_in_ha_version",
+        "learn_more_url",
+    )
+    return [{k: i.get(k) for k in keys if k in i} for i in result.get("issues", [])]
+
+
+@tool
+async def list_repairs(domain: str = "", contains: str = "") -> str:
+    """Home Assistant's repairs (Settings > Repairs): each issue's domain, id,
+    severity, translation key and placeholders, and whether it is fixable or
+    ignored. HACS raises one when a download needs a restart. `domain` keeps
+    one integration's issues; `contains` searches the whole issue."""
+    needle = contains.lower()
+    out = [
+        i
+        for i in await _repairs()
+        if (not domain or i.get("domain") == domain)
+        and (not needle or needle in json.dumps(i, default=str).lower())
+    ]
+    return _dump({"count": len(out), "issues": out})
+
+
+_HACS_KEYS = (
+    "full_name",
+    "name",
+    "category",
+    "domain",
+    "installed",
+    "installed_version",
+    "available_version",
+    "status",
+    "pending_upgrade",
+    "last_updated",
+)
+
+
+async def _hacs_repositories() -> tuple[list[dict], str | None]:
+    """HACS's repositories, or an error message (HACS missing or refusing)."""
+    try:
+        result = await ha_ws_call({"type": "hacs/repositories/list"}, timeout=60)
+    except Exception as e:  # HACS isn't installed, or answered with an error
+        return [], f"{type(e).__name__}: {e}"
+    return [{k: r.get(k) for k in _HACS_KEYS if k in r} for r in result], None
+
+
+@tool
+async def list_hacs_repositories(
+    contains: str = "", installed_only: bool = True
+) -> str:
+    """Repositories HACS knows about: GitHub name, category, the integration's
+    domain, whether it is downloaded (`installed`), the installed and newest
+    versions, and HACS's `status` (e.g. pending-restart after a download, until
+    Home Assistant restarts). `contains` filters on name or domain;
+    `installed_only` (default) keeps the downloaded ones."""
+    repos, error = await _hacs_repositories()
+    needle = contains.lower()
+    out = []
+    for r in repos:
+        if installed_only and not r.get("installed"):
+            continue
+        names = f"{r.get('full_name')} {r.get('name')} {r.get('domain')}".lower()
+        if needle and needle not in names:
+            continue
+        out.append(r)
+    return _dump({"error": error, "count": len(out), "repositories": out})
+
+
+# Logged at every start for every custom integration: not a problem.
+_UNTESTED = "has not been tested by Home Assistant"
+
+
+def _failed(result) -> str | None:
+    """A gathered call's error as text, or None if it succeeded."""
+    if isinstance(result, BaseException):
+        return f"{type(result).__name__}: {result}"
+    return None
+
+
+def _findings(
+    domain: str,
+    manifest: dict | None,
+    offers_setup: bool | None,
+    entries: list[dict],
+    deps: list[dict],
+    hacs: list[dict],
+    log: list[str],
+) -> list[str]:
+    """What diagnose_integration's results add up to, in plain words."""
+    out: list[str] = []
+    downloaded = any(r.get("installed") for r in hacs)
+    if manifest is None:
+        if downloaded:
+            out.append(
+                "HACS has downloaded it, but Home Assistant hasn't found it: "
+                "restart Home Assistant."
+            )
+        elif hacs:
+            out.append("HACS knows the repository but hasn't downloaded it.")
+        else:
+            out.append(
+                "Home Assistant doesn't know this domain: it isn't downloaded "
+                "(or its folder in custom_components has another name), or "
+                "Home Assistant hasn't restarted since."
+            )
+    else:
+        if manifest.get("config_flow") and offers_setup is False:
+            out.append(
+                "Its manifest says it has a config flow, but Home Assistant "
+                "doesn't offer it: look in the log for errors loading it."
+            )
+        if not manifest.get("config_flow"):
+            out.append("Its manifest has no config flow (set up from YAML only).")
+        for d in deps:
+            if not d["loaded"]:
+                out.append(
+                    f"Its dependency {d['domain']!r} isn't loaded, so it can't "
+                    "be set up until that is."
+                )
+    for e in entries:
+        if e["state"] not in ("loaded", "not_loaded"):
+            reason = e.get("reason") or "no reason given"
+            out.append(f"Entry {e['title']!r} is {e['state']}: {reason}.")
+    for r in hacs:
+        if "restart" in str(r.get("status") or ""):
+            out.append("HACS says a restart is pending for it.")
+        running = (manifest or {}).get("version")
+        have = r.get("installed_version")
+        # a branch download's "version" is a commit hash: only compare versions
+        is_version = re.match(r"v?\d+\.", str(have or ""))
+        if r.get("installed") and running and is_version and str(running) not in have:
+            out.append(
+                f"HACS has {have} but Home Assistant is running {running}: "
+                "restart Home Assistant."
+            )
+    if log:
+        many = "s mention" if len(log) > 1 else " mentions"
+        out.append(f"{len(log)} warning or error{many} {domain} in the log.")
+    return out or ["Nothing wrong found."]
+
+
+@tool
+async def diagnose_integration(domain: str, log_lines: int = 30) -> str:
+    """Why an integration can't be set up, or isn't working: everything about
+    one domain in one call.
+
+    - `findings`: what the rest adds up to, in plain words.
+    - `known`: whether Home Assistant has found it, with its `manifest` (name,
+      version, config_flow, dependencies, ...). A custom integration
+      downloaded since the last restart isn't known until Home Assistant
+      restarts.
+    - `offers_setup_form`: whether it is among the integrations Home
+      Assistant offers under "Add integration".
+    - `entries`: its config entries' state and any setup error.
+    - `dependencies`: each dependency in its manifest, and whether it is loaded.
+    - `hacs`: HACS's record of it (downloaded, versions, status).
+    - `repairs`: its repairs, and HACS's restart repairs.
+    - `log`: the last `log_lines` warnings and errors that mention it (read
+      one in full with get_log_entry).
+    """
+    results = await asyncio.gather(
+        ha_ws_call({"type": "manifest/get", "integration": domain}),
+        ha_rest_get("/api/config/config_entries/flow_handlers"),
+        ha_ws_call({"type": "config_entries/get", "domain": domain}),
+        ha_rest_get("/api/config"),
+        _hacs_repositories(),
+        _repairs(),
+        _fetch_log_records(),
+        return_exceptions=True,
+    )
+    manifest, handlers, entries, config, hacs_result, repairs, records = results
+
+    manifest = manifest if isinstance(manifest, dict) else None
+    offers_setup = domain in handlers if isinstance(handlers, list) else None
+    loaded = set()
+    if isinstance(config, dict):
+        loaded = {c.split(".", 1)[0] for c in config.get("components", [])}
+    entries = [
+        {k: e.get(k) for k in ("entry_id", "title", "state", "reason", "disabled_by")}
+        for e in (entries if isinstance(entries, list) else [])
+    ]
+    deps = [
+        {"domain": d, "loaded": d in loaded}
+        for d in (manifest or {}).get("dependencies", [])
+    ]
+    repos, hacs_error = (
+        hacs_result if isinstance(hacs_result, tuple) else ([], _failed(hacs_result))
+    )
+    hacs = [r for r in repos if r.get("domain") == domain]
+    own_repairs = []
+    for issue in repairs if isinstance(repairs, list) else []:
+        text = json.dumps(issue, default=str).lower()
+        ours = issue.get("domain") == domain
+        hacs_restart = issue.get("domain") == "hacs" and (
+            domain in text or "restart" in text
+        )
+        if ours or hacs_restart:
+            own_repairs.append(issue)
+    log: list[str] = []
+    for rec in records if isinstance(records, list) else []:
+        if domain not in "\n".join(rec) or _UNTESTED in rec[0]:
+            continue
+        if not any(f" {x} " in rec[0] for x in ("WARNING", "ERROR", "CRITICAL")):
+            continue
+        extra = len(rec) - 1
+        log.append(rec[0] + (f"  [+{extra} lines]" if extra else ""))
+    log = log[-log_lines:]
+
+    calls = ("manifest", "flow_handlers", "config_entries", "config")
+    errors = {
+        name: _failed(r)
+        for name, r in zip(
+            (*calls, "hacs", "repairs", "log"), results, strict=True
+        )
+        if name != "manifest" and _failed(r)
+    }
+    return _dump(
+        {
+            "domain": domain,
+            "findings": _findings(
+                domain, manifest, offers_setup, entries, deps, hacs, log
+            ),
+            "known": manifest is not None,
+            "manifest": manifest,
+            "offers_setup_form": offers_setup,
+            "entries": entries,
+            "dependencies": deps,
+            "hacs": hacs,
+            "hacs_error": hacs_error,
+            "repairs": own_repairs,
+            "log": log,
+            "errors": errors,
         }
     )
 

@@ -65,6 +65,14 @@ without an `id` can't be read by `get_automation_config`, `list_traces` or `get_
 | `list_integrations` | `contains=""`, `custom_only=False` | Every installed integration with `activated` (loaded or not), its config entry states, and its version: the integration's own version for custom ones (e.g. HACS), the HA core version for core ones. `manifest_error` is set if HA refuses the manifest list. |
 | `get_recent_events` | `contains=""`, `event_type=""`, `minutes=720` | Events seen live since the server started: state changes of the entities matching `EVENT_BUFFER_ENTITIES`, and `automation_triggered`. |
 
+### Setting up integrations
+
+| Tool | Arguments | Description |
+| --- | --- | --- |
+| `diagnose_integration` | `domain`, `log_lines=30` | Why an integration can't be set up or isn't working, in one call: `findings` in plain words, then whether Home Assistant knows it (its manifest), whether **Add integration** offers it (`offers_setup_form`), its config entries, whether its dependencies are loaded, HACS's record of it, its repairs (and HACS's restart repairs) and the warnings and errors that mention it. Tells apart "not downloaded", "downloaded but Home Assistant not restarted", "failed to load" and "a dependency isn't loaded". |
+| `list_repairs` | `domain=""`, `contains=""` | Home Assistant's repairs (Settings > Repairs): domain, issue ID, severity, translation key and placeholders, fixable, ignored. HACS raises one when a download needs a restart. |
+| `list_hacs_repositories` | `contains=""`, `installed_only=True` | What HACS has downloaded: GitHub name, category, the integration's domain, installed and newest versions, and HACS's `status` (e.g. pending a restart). A download from a branch has a commit hash for its version. `error` is set if HACS isn't installed. |
+
 Large results are truncated at about 60,000 characters.
 
 ## Configuration
