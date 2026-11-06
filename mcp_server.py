@@ -27,7 +27,7 @@ MCP_PUBLIC_URL = os.environ["MCP_PUBLIC_URL"].rstrip("/")
 
 # Bump on every change to the tool set. Build metadata comes from the image
 # (see Dockerfile) and falls back to "unknown" for non-Docker runs.
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 BUILD_COMMIT = os.environ.get("BUILD_COMMIT", "unknown")
 BUILD_DATE = os.environ.get("BUILD_DATE", "unknown")
 STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -553,6 +553,82 @@ async def get_config_entries(domain: str) -> str:
             )
         out.append(item)
     return _dump(out)
+
+
+async def _house_structure_from_diagnostics() -> dict:
+    """Fallback when house_structure/layout is not yet available on HA."""
+    entries = await ha_ws_call(
+        {"type": "config_entries/get", "domain": "house_structure"}
+    )
+    if not entries:
+        return {"error": "House Structure is not set up"}
+    entry_id = entries[0]["entry_id"]
+    diagnostics = await ha_rest_get(
+        f"/api/diagnostics/config_entry/{quote(entry_id)}"
+    )
+    data = diagnostics.get("data", diagnostics)
+    # Drop live entity/sky noise so the layout stays readable.
+    for part in data.get("parts") or []:
+        part.pop("entities", None)
+    data.pop("sky", None)
+    data["source"] = "diagnostics"
+    return data
+
+
+@tool
+async def get_house_structure(
+    include_sheet: bool = True,
+    detail: str = "full",
+) -> str:
+    """Current House Structure layout from Home Assistant: house settings
+    (rotation, unit, shading), each part's saved settings and built attributes
+    (rooms with size/position/neighbours, walls/windows/doors/internal walls/
+    registers), every area with the parts in it and its neighbours, and by
+    default the parts as a CSV `sheet` (same columns as the Reconfigure form).
+
+    Prefer this over get_config_entries("house_structure") when reviewing how
+    rooms are laid out or which faces are outside vs open.
+
+    `include_sheet` (default true) asks for the CSV. `detail` is `full` (default:
+    settings + parts + areas + sheet) or `sheet` (house settings + CSV only).
+    Falls back to diagnostics when the integration is older than the layout
+    websocket command."""
+    detail = (detail or "full").strip().lower()
+    if detail not in ("full", "sheet"):
+        return "Error: detail must be 'full' or 'sheet'."
+    want_sheet = include_sheet or detail == "sheet"
+    try:
+        data = await ha_ws_call(
+            {"type": "house_structure/layout", "include_sheet": want_sheet}
+        )
+        if isinstance(data, dict):
+            data["source"] = "house_structure/layout"
+        else:
+            data = {"error": f"unexpected layout reply: {data!r}"}
+    except RuntimeError as ws_error:
+        try:
+            data = await _house_structure_from_diagnostics()
+        except Exception:
+            return f"Error: {ws_error}"
+    if data.get("error"):
+        return _dump(data)
+    if detail == "sheet":
+        slim = {
+            "source": data.get("source"),
+            "house": data.get("house"),
+            "options": data.get("options"),
+            "sheet": data.get("sheet"),
+            "skipped": data.get("skipped"),
+        }
+        if slim["sheet"] is None and data.get("parts") is not None:
+            slim["note"] = (
+                "CSV sheet unavailable on this HA build; use detail='full' "
+                "for parts and areas, or update House Structure."
+            )
+        return _dump(slim, limit=120000)
+    if not include_sheet:
+        data = {k: v for k, v in data.items() if k != "sheet"}
+    return _dump(data, limit=120000)
 
 
 async def _manifests() -> tuple[list[dict], str | None]:

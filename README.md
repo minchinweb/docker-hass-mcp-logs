@@ -62,6 +62,7 @@ without an `id` can't be read by `get_automation_config`, `list_traces` or `get_
 | `list_areas` | none | Floors (with level) and areas (ID, name, floor, aliases). |
 | `list_integration_entities` | `domain`, `include_attributes=True` | Every entity an integration provides (e.g. `house_structure`), with its device, area, floor, state and attributes. Finds renamed entities too. |
 | `get_config_entries` | `domain` | An integration's config entries and their subentries (ID, type, title). Home Assistant's API doesn't give the saved settings, so they come from the integration's diagnostics where it has them. |
+| `get_house_structure` | `include_sheet=True`, `detail="full"` | Current House Structure layout: house settings, each part's settings and built attributes, areas with neighbours, and by default the parts CSV sheet. Prefer this when reviewing room layout. `detail="sheet"` returns settings + CSV only. Falls back to diagnostics if the integration is older than the layout websocket. |
 | `list_integrations` | `contains=""`, `custom_only=False` | Every installed integration with `activated` (loaded or not), its config entry states, and its version: the integration's own version for custom ones (e.g. HACS), the HA core version for core ones. `manifest_error` is set if HA refuses the manifest list. |
 | `get_recent_events` | `contains=""`, `event_type=""`, `minutes=720` | Events seen live since the server started: state changes of the entities matching `EVENT_BUFFER_ENTITIES`, and `automation_triggered`. |
 
