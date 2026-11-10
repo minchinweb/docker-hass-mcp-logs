@@ -34,7 +34,7 @@ DOCKER_SOCKET = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")
 
 # Bump on every change to the tool set. Build metadata comes from the image
 # (see Dockerfile) and falls back to "unknown" for non-Docker runs.
-VERSION = "1.12.0"
+VERSION = "1.12.1"
 BUILD_COMMIT = os.environ.get("BUILD_COMMIT", "unknown")
 BUILD_DATE = os.environ.get("BUILD_DATE", "unknown")
 STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1436,8 +1436,37 @@ async def _container_network(name: str) -> dict:
     }
 
 
-def _network_relation(me: dict, matter: dict) -> dict:
-    """Whether this server hears the same mDNS as the Matter server, and why."""
+def _own_container_id() -> str | None:
+    """This container's Docker ID, read from /proc (the hostname can't be used:
+    a container that shares another's network stack shares its hostname too)."""
+    for path in ("/proc/self/mountinfo", "/proc/self/cgroup"):
+        try:
+            text = open(path).read()
+        except OSError:
+            continue
+        if m := re.search(r"/containers/([0-9a-f]{64})/", text) or re.search(
+            r"docker[-/]([0-9a-f]{64})", text
+        ):
+            return m.group(1)
+    return None
+
+
+def _network_relation(
+    me: dict, matter: dict, local: dict[str, list[str]] | None = None
+) -> dict:
+    """Whether this server hears the same mDNS as the Matter server, and why.
+    `local` is this container's own addresses, used when it couldn't be
+    inspected."""
+    if "error" in me and "error" not in matter and local:
+        theirs = {n["ip"] for n in matter["networks"].values() if n.get("ip")}
+        mine = {ip for ips in local.values() for ip in ips}
+        if theirs and theirs <= mine:
+            return {
+                "same_view": True,
+                "explanation": "This container has all of the Matter container's "
+                f"addresses ({', '.join(sorted(theirs))}), so it shares its "
+                "network stack and hears the same mDNS.",
+            }
     if "error" in me or "error" in matter:
         return {
             "same_view": None,
@@ -1598,12 +1627,13 @@ async def test_mdns(seconds: float = 6, extra_types: str = "") -> str:
             rows.append(row)
         services[stype] = rows
 
-    me_name = socket.gethostname()
+    me_name = _own_container_id() or socket.gethostname()
+    local = _local_addresses()
     if MATTER_CONTAINER:
         me, matter = await asyncio.gather(
             _container_network(me_name), _container_network(MATTER_CONTAINER)
         )
-        relation = _network_relation(me, matter)
+        relation = _network_relation(me, matter, local)
         network = {"this_server": me, "matter_server": matter, **relation}
     else:
         network = {
@@ -1651,7 +1681,7 @@ async def test_mdns(seconds: float = 6, extra_types: str = "") -> str:
             "ip_note": ip_note,
             "findings": findings,
             "network": network,
-            "this_server_addresses": _local_addresses(),
+            "this_server_addresses": local,
             "known_matter_nodes": sorted(known_nodes),
             "services": services,
             "service_meaning": _MDNS_TYPES,
