@@ -1,3 +1,4 @@
 httpx
 mcp >=2,<3
 websockets
+zeroconf
