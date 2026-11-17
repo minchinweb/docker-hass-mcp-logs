@@ -34,7 +34,7 @@ DOCKER_SOCKET = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")
 
 # Bump on every change to the tool set. Build metadata comes from the image
 # (see Dockerfile) and falls back to "unknown" for non-Docker runs.
-VERSION = "1.12.1"
+VERSION = "1.13.0"
 BUILD_COMMIT = os.environ.get("BUILD_COMMIT", "unknown")
 BUILD_DATE = os.environ.get("BUILD_DATE", "unknown")
 STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -235,6 +235,66 @@ def _since(hours: float) -> str:
     """ISO timestamp `hours` ago (UTC), URL-safe for use in a path."""
     ts = datetime.now(timezone.utc) - timedelta(hours=hours)
     return quote(ts.isoformat(timespec="seconds"), safe="")
+
+
+HISTORY_CHUNK = timedelta(days=int(os.environ.get("HISTORY_CHUNK_DAYS", "7")))
+
+
+def _parse_time(value: str) -> datetime:
+    """ISO 8601 timestamp as an aware datetime (naive values are UTC)."""
+    ts = datetime.fromisoformat(value)
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+def _iso(ts: datetime) -> str:
+    return ts.isoformat(timespec="seconds")
+
+
+def _path_time(ts: datetime) -> str:
+    return quote(_iso(ts), safe="")
+
+
+def _windows(start: datetime, end: datetime):
+    """Consecutive (start, end) pairs of at most HISTORY_CHUNK covering the range."""
+    cur = start
+    while cur < end:
+        nxt = min(cur + HISTORY_CHUNK, end)
+        yield cur, nxt
+        cur = nxt
+
+
+async def _fetch_history(params: dict, start: datetime, end: datetime) -> list:
+    """History for one entity over [start, end], fetched chunk by chunk.
+
+    Chunks overlap at their edges (each starts with the state in force at its
+    start), so duplicate rows are dropped."""
+    seen, rows = set(), []
+    for s, e in _windows(start, end):
+        chunk = await ha_rest_get(
+            f"/api/history/period/{_path_time(s)}", {**params, "end_time": _iso(e)}
+        )
+        for series in chunk:
+            for row in series:
+                key = (row.get("state"), row.get("last_changed"))
+                if key not in seen:
+                    seen.add(key)
+                    rows.append(row)
+    return [rows]
+
+
+async def _fetch_logbook(params: dict, start: datetime, end: datetime) -> list:
+    """Logbook entries over [start, end], fetched chunk by chunk, de-duplicated."""
+    seen, entries = set(), []
+    for s, e in _windows(start, end):
+        chunk = await ha_rest_get(
+            f"/api/logbook/{_path_time(s)}", {**params, "end_time": _iso(e)}
+        )
+        for entry in chunk:
+            key = json.dumps(entry, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                entries.append(entry)
+    return entries
 
 
 def _dump(obj, limit: int = 60000) -> str:
@@ -452,18 +512,31 @@ async def get_logbook(
     contains: str = "",
     exclude: str = "",
     limit: int = 0,
+    start_time: str = "",
+    end_time: str = "",
 ) -> str:
     """Logbook entries for the last N hours, optionally for one entity. Shows
     automation triggers and state changes, so it can tell 'never triggered'
     from 'triggered but failed'.
+
+    For an older window, pass `start_time` (ISO 8601, e.g.
+    2026-11-10T00:00:00+00:00) and optionally `end_time`; these replace `hours`.
+    Long ranges are fetched in chunks (HISTORY_CHUNK_DAYS, default 7 days).
 
     The logbook can be huge (every `last_seen` sensor logs each update), so
     narrow it: `contains` keeps entries whose entity, name, state or message
     contain the text; `exclude` drops entries matching any of its
     comma-separated texts (e.g. `last_seen,sun.sun`); `limit` keeps only the
     newest N (0 = all). The reply gives `matched` (before `limit`)."""
-    params = {"entity": entity_id} if entity_id else None
-    entries = await ha_rest_get(f"/api/logbook/{_since(hours)}", params)
+    params = {"entity": entity_id} if entity_id else {}
+    if start_time:
+        start = _parse_time(start_time)
+        end = _parse_time(end_time) if end_time else datetime.now(timezone.utc)
+        if start >= end:
+            return "Error: start_time must be before end_time"
+        entries = await _fetch_logbook(params, start, end)
+    else:
+        entries = await ha_rest_get(f"/api/logbook/{_since(hours)}", params or None)
     needle = contains.lower()
     drop = [x.strip().lower() for x in exclude.split(",") if x.strip()]
     if needle or drop:
@@ -485,14 +558,28 @@ async def get_logbook(
 
 @tool
 async def get_history(
-    entity_id: str, hours: float = 24, include_attributes: bool = False
+    entity_id: str,
+    hours: float = 24,
+    include_attributes: bool = False,
+    start_time: str = "",
+    end_time: str = "",
 ) -> str:
     """State history of one entity for the last N hours (state + timestamps).
     Set include_attributes=True for full states with attributes, e.g. the
-    `event_type` of an event entity."""
+    `event_type` of an event entity.
+
+    For an older window, pass `start_time` (ISO 8601, e.g.
+    2026-11-10T00:00:00+00:00) and optionally `end_time`; these replace `hours`.
+    Long ranges are fetched in chunks (HISTORY_CHUNK_DAYS, default 7 days)."""
     params = {"filter_entity_id": entity_id}
     if not include_attributes:
         params.update({"minimal_response": "1", "no_attributes": "1"})
+    if start_time:
+        start = _parse_time(start_time)
+        end = _parse_time(end_time) if end_time else datetime.now(timezone.utc)
+        if start >= end:
+            return "Error: start_time must be before end_time"
+        return _dump(await _fetch_history(params, start, end))
     return _dump(await ha_rest_get(f"/api/history/period/{_since(hours)}", params))
 
 
