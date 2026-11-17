@@ -34,7 +34,7 @@ DOCKER_SOCKET = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")
 
 # Bump on every change to the tool set. Build metadata comes from the image
 # (see Dockerfile) and falls back to "unknown" for non-Docker runs.
-VERSION = "1.13.0"
+VERSION = "1.13.1"
 BUILD_COMMIT = os.environ.get("BUILD_COMMIT", "unknown")
 BUILD_DATE = os.environ.get("BUILD_DATE", "unknown")
 STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -266,15 +266,19 @@ def _windows(start: datetime, end: datetime):
 async def _fetch_history(params: dict, start: datetime, end: datetime) -> list:
     """History for one entity over [start, end], fetched chunk by chunk.
 
-    Chunks overlap at their edges (each starts with the state in force at its
-    start), so duplicate rows are dropped."""
+    Each chunk opens with a marker row (entity_id, attributes, last_changed at
+    the window start) giving the state in force then. Only the first chunk's
+    marker is kept; the later ones repeat the previous chunk's last state, so
+    they are skipped. Real change rows are de-duplicated by (state, time)."""
     seen, rows = set(), []
-    for s, e in _windows(start, end):
+    for index, (s, e) in enumerate(_windows(start, end)):
         chunk = await ha_rest_get(
             f"/api/history/period/{_path_time(s)}", {**params, "end_time": _iso(e)}
         )
         for series in chunk:
             for row in series:
+                if index > 0 and "entity_id" in row:
+                    continue  # window-start marker, already covered
                 key = (row.get("state"), row.get("last_changed"))
                 if key not in seen:
                     seen.add(key)
