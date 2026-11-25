@@ -20,12 +20,10 @@ ENV BUILD_COMMIT=${COMMIT} \
     BUILD_DATE=${BUILD_DATE}
 
 LABEL maintainer="MinchinWeb" \
-      org.label-schema.description="MCP server tp expose Home Assistant logs" \
+      org.label-schema.description="MCP server to expose Home Assistant logs" \
       org.label-schema.build-date=${BUILD_DATE} \
       org.label-schema.vcs-url=${URL} \
       org.label-schema.vcs-ref=${COMMIT} \
       org.label-schema.schema-version="1.0.0-rc1"
-
-# RUN export SERVER_VERSION="$(grep -oP '__version__\s+=\s+\"?\K[\d\w\.]+' ./ddns.py)"
 
 CMD [ "python", "./mcp_server.py" ]
